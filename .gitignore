@@ -1,1 +1,32 @@
 .env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Streamlit secrets (keep local only)
+.streamlit/secrets.toml
+
+# Logs
+*.log
+
+# Cache
+.cache/
+
+ui.py
