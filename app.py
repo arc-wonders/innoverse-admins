@@ -15,13 +15,20 @@ st.set_page_config(
 )
 
 # MongoDB connection
-MONGO_URI = st.secrets.get("MONGO_URI") or os.getenv("MONGO_URI")
-DATABASE_NAME = st.secrets.get("DATABASE_NAME", "Cluster0")
+def _get_secret(name: str, default=None):
+    # Works whether .streamlit/secrets.toml exists or not
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.getenv(name, default)
+
+MONGO_URI = _get_secret("MONGO_URI")
+DATABASE_NAME = _get_secret("DATABASE_NAME", "Cluster0")
 
 @st.cache_resource
 def init_connection():
     if not MONGO_URI:
-        st.error("MONGO_URI is not set in secrets or environment.")
+        st.error("Missing MONGO_URI. Set it in Render → Environment or in .streamlit/secrets.toml")
         st.stop()
     return pymongo.MongoClient(MONGO_URI)
 
