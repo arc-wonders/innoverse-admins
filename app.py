@@ -6,6 +6,8 @@ from bson import ObjectId
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import hashlib
+import secrets
 
 # Set page config first
 st.set_page_config(
@@ -35,6 +37,7 @@ tasks_col = db.tasks
 submissions_col = db.submissions
 forums_col = db.forums
 forum_comments_col = db.forum_comments
+sessions_col = db.admin_sessions
 
 # Track mapping
 TRACKS = {
@@ -44,42 +47,97 @@ TRACKS = {
     "app": "App Development"
 }
 
+def create_session_token():
+    """Create a secure session token"""
+    return secrets.token_urlsafe(32)
+
 def authenticate_admin(username, password):
+    """Authenticate admin and create secure session"""
     admin = admin_col.find_one({"username": username, "password": password})
     if admin:
+        # Create a secure session token
+        session_token = create_session_token()
+        session_data = {
+            "token": session_token,
+            "admin_id": admin["_id"],
+            "username": username,
+            "created_at": datetime.now(timezone.utc),
+            "expires_at": datetime.now(timezone.utc).timestamp() + 86400  # 24 hours
+        }
+        
+        # Store session in database
+        sessions_col.insert_one(session_data)
+        
         # Update last login
         admin_col.update_one(
             {"_id": admin["_id"]},
             {"$set": {"last_login": datetime.now(timezone.utc)}}
         )
-        return True
-    return False
+        
+        return session_token
+    return None
+
+def validate_session(session_token):
+    """Validate session token"""
+    if not session_token:
+        return False
+    
+    session = sessions_col.find_one({"token": session_token})
+    if not session:
+        return False
+    
+    # Check if session has expired
+    current_time = datetime.now(timezone.utc).timestamp()
+    if current_time > session["expires_at"]:
+        # Clean up expired session
+        sessions_col.delete_one({"token": session_token})
+        return False
+    
+    # Extend session expiry on valid use
+    sessions_col.update_one(
+        {"token": session_token},
+        {"$set": {"expires_at": current_time + 86400}}  # Extend by 24 hours
+    )
+    
+    return session["username"]
+
+def logout_admin(session_token):
+    """Logout admin and clean up session"""
+    if session_token:
+        sessions_col.delete_one({"token": session_token})
+
+def cleanup_expired_sessions():
+    """Clean up expired sessions"""
+    current_time = datetime.now(timezone.utc).timestamp()
+    sessions_col.delete_many({"expires_at": {"$lt": current_time}})
 
 def main():
-    # Initialize session state with persistent login
-    if "authenticated" not in st.session_state:
-        # Check if there's a stored admin session (using query params as simple persistence)
-        query_params = st.query_params
-        if "admin_session" in query_params:
-            stored_admin = query_params["admin_session"]
-            # Verify the admin still exists
-            admin = admin_col.find_one({"username": stored_admin})
-            if admin:
-                st.session_state.authenticated = True
-                st.session_state.admin_username = stored_admin
-            else:
-                st.session_state.authenticated = False
-        else:
-            st.session_state.authenticated = False
+    # Clean up expired sessions periodically
+    cleanup_expired_sessions()
     
+    # Initialize session state
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
     if "admin_username" not in st.session_state:
         st.session_state.admin_username = None
+    if "session_token" not in st.session_state:
+        st.session_state.session_token = None
+    
+    # Check if user has valid session
+    if st.session_state.session_token:
+        username = validate_session(st.session_state.session_token)
+        if username:
+            st.session_state.authenticated = True
+            st.session_state.admin_username = username
+        else:
+            # Invalid session, clear state
+            st.session_state.authenticated = False
+            st.session_state.admin_username = None
+            st.session_state.session_token = None
     
     if not st.session_state.authenticated:
         login_page()
     else:
-        # Maintain session in URL for persistence
-        st.query_params["admin_session"] = st.session_state.admin_username
         admin_dashboard()
 
 def login_page():
@@ -97,18 +155,17 @@ def login_page():
             submit = st.form_submit_button("Login", use_container_width=True)
             
             if submit:
-                if authenticate_admin(username, password):
+                session_token = authenticate_admin(username, password)
+                if session_token:
                     st.session_state.authenticated = True
                     st.session_state.admin_username = username
-                    # Set session in URL for persistence
-                    st.query_params["admin_session"] = username
+                    st.session_state.session_token = session_token
                     st.success("Login successful!")
                     st.rerun()
                 else:
                     st.error("Invalid credentials!")
         
         st.markdown("---")
-        
 
 def admin_dashboard():
     st.title("🚀 Innoverse Admin Dashboard")
@@ -117,10 +174,10 @@ def admin_dashboard():
     st.sidebar.title(f"Welcome, {st.session_state.admin_username}!")
     
     if st.sidebar.button("Logout"):
+        logout_admin(st.session_state.session_token)
         st.session_state.authenticated = False
         st.session_state.admin_username = None
-        # Clear the session from URL
-        st.query_params.clear()
+        st.session_state.session_token = None
         st.rerun()
     
     st.sidebar.markdown("---")
