@@ -1,6 +1,8 @@
 import streamlit as st
 import pymongo
 from datetime import datetime, timezone
+from authlib.integrations.requests_client import OAuth2Session
+import urllib.parse
 import pandas as pd
 from bson import ObjectId
 import plotly.express as px
@@ -8,6 +10,20 @@ import plotly.graph_objects as go
 import os
 import hashlib
 import secrets
+
+import threading, requests, time
+
+def keep_alive():
+    while True:
+        try:
+            url = os.getenv("RENDER_URL")  # 👈 must be set in Render env vars
+            if url:
+                requests.get(url, timeout=10)
+                print(f"[HealthCheck] Pinged {url}")
+        except Exception as e:
+            print(f"[HealthCheck] Failed: {e}")
+        time.sleep(600)  # 10 minutes
+
 
 # Set page config first
 st.set_page_config(
@@ -30,6 +46,7 @@ def init_connection():
 client = init_connection()
 db = client[DATABASE_NAME]
 
+
 # Collections
 admin_col = db.admins
 users_col = db.users
@@ -46,6 +63,20 @@ TRACKS = {
     "dsa": "Data Structures & Algorithms",
     "app": "App Development"
 }
+
+# OAuth2 session for Google authentication
+def get_google_auth(state=None, token=None):
+    client_id = os.getenv("GOOGLE_CLIENT_ID")
+    redirect_uri = os.getenv("OAUTH_REDIRECT_URI")
+
+    return OAuth2Session(
+        client_id=client_id,
+        scope="openid email profile",
+        redirect_uri=redirect_uri,
+        state=state,
+        token=token
+    )
+
 
 def create_session_token():
     """Create a secure session token"""
@@ -66,12 +97,19 @@ def authenticate_admin(username, password):
         }
         
         # Store session in database
-        sessions_col.insert_one(session_data)
+        sessions_col.update_one(
+            {"admin_id": admin["_id"]},  # find by admin
+            {"$set": session_data},
+            upsert=True
+        )
         
-        # Update last login
+        # Update last login + increment login counter
         admin_col.update_one(
             {"_id": admin["_id"]},
-            {"$set": {"last_login": datetime.now(timezone.utc)}}
+            {
+                "$set": {"last_login": datetime.now(timezone.utc)},
+                "$inc": {"login_count": 1}  # 👈 add or increment counter
+            }
         )
         
         return session_token
@@ -112,6 +150,12 @@ def cleanup_expired_sessions():
     sessions_col.delete_many({"expires_at": {"$lt": current_time}})
 
 def main():
+
+    # --- Start health check thread once ---
+    if "health_thread" not in st.session_state:
+        st.session_state["health_thread"] = True
+        threading.Thread(target=keep_alive, daemon=True).start()
+
     # Clean up expired sessions periodically
     cleanup_expired_sessions()
     
@@ -122,8 +166,76 @@ def main():
         st.session_state.admin_username = None
     if "session_token" not in st.session_state:
         st.session_state.session_token = None
+
+    # --- Google OAuth callback handler ---
+    params = st.query_params
+    if "code" in params and not st.session_state.authenticated:
+        # Rebuild full redirect URL with query string
+        query_string = urllib.parse.urlencode({k: v for k, v in params.items()})
+        full_url = f"{os.getenv('OAUTH_REDIRECT_URI')}?{query_string}"
     
-    # Check if user has valid session
+        google = get_google_auth(state=st.session_state.get("oauth_state"))
+        token = google.fetch_token(
+            "https://oauth2.googleapis.com/token",
+            authorization_response=full_url,
+            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+            redirect_uri=os.getenv("OAUTH_REDIRECT_URI"),
+            auth=None   # 👈 IMPORTANT FIX
+        )
+
+    
+        google = get_google_auth(token=token)
+        resp = google.get("https://www.googleapis.com/oauth2/v2/userinfo")
+        profile = resp.json()
+    
+        email = profile.get("email")
+        name = profile.get("name")
+    
+        # Check if this email is an admin in Mongo
+        admin = admin_col.find_one({"email": email})
+        if admin:
+            session_token = create_session_token()
+            session_data = {
+                "token": session_token,
+                "admin_id": admin["_id"],
+                "username": admin["username"],
+                "created_at": datetime.now(timezone.utc),
+                "expires_at": datetime.now(timezone.utc).timestamp() + 86400  # 24h
+            }
+        
+            # Store session in DB
+            # Upsert session → only 1 per admin
+            sessions_col.update_one(
+                {"admin_id": admin["_id"]},
+                {"$set": session_data},
+                upsert=True
+            )
+            
+            # Update last login + increment login counter
+            admin_col.update_one(
+                {"_id": admin["_id"]},
+                {
+                    "$set": {"last_login": datetime.now(timezone.utc)},
+                    "$inc": {"login_count": 1}
+                }
+            )
+            
+        
+            # Set session state
+            st.session_state.authenticated = True
+            st.session_state.admin_username = admin["username"]
+            st.session_state.session_token = session_token
+        
+            # Clear query params so code doesn’t keep firing
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.error("Your Google account is not authorized as admin.")
+        
+    # --- End OAuth callback handler ---
+
+
+    # --- Validate session ---
     if st.session_state.session_token:
         username = validate_session(st.session_state.session_token)
         if username:
@@ -134,7 +246,9 @@ def main():
             st.session_state.authenticated = False
             st.session_state.admin_username = None
             st.session_state.session_token = None
-    
+    # --- End session validation ---
+
+    # --- Show login or dashboard ---
     if not st.session_state.authenticated:
         login_page()
     else:
@@ -148,25 +262,26 @@ def login_page():
     
     with col2:
         st.subheader("Admin Login")
-        
-        with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submit = st.form_submit_button("Login", use_container_width=True)
-            
-            if submit:
-                session_token = authenticate_admin(username, password)
-                if session_token:
-                    st.session_state.authenticated = True
-                    st.session_state.admin_username = username
-                    st.session_state.session_token = session_token
-                    st.success("Login successful!")
-                    st.rerun()
-                else:
-                    st.error("Invalid credentials!")
-        
-        st.markdown("---")
 
+        # Google login only
+        google_auth = get_google_auth()
+        authorization_url, state = google_auth.create_authorization_url(
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        )
+        
+        # Save state in session
+        if "oauth_state" not in st.session_state:
+            st.session_state["oauth_state"] = state
+        
+        # Login button (stays in same tab)
+        st.markdown(
+            f'<a href="{authorization_url}" target="_self">'
+            f'<button style="width:100%;padding:10px;background:#4285F4;color:white;'
+            f'border:none;border-radius:5px;font-size:16px">Sign in with Google</button>'
+            f'</a>',
+            unsafe_allow_html=True
+        )
+      
 def admin_dashboard():
     st.title("🚀 Innoverse Admin Dashboard")
     

@@ -28,5 +28,5 @@ Thumbs.db
 
 # Cache
 .cache/
-
-ui.py
+test.py
+app2.py
