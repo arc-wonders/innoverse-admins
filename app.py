@@ -170,18 +170,128 @@ def main():
     # --- Google OAuth callback handler ---
     params = st.query_params
     if "code" in params and not st.session_state.authenticated:
-        # Rebuild full redirect URL with query string
-        query_string = urllib.parse.urlencode({k: v for k, v in params.items()})
-        full_url = f"{os.getenv('OAUTH_REDIRECT_URI')}?{query_string}"
+        code = params.get("code")
+        returned_state = params.get("state")
+        expected_state = st.session_state.get("oauth_state")
     
-        google = get_google_auth(state=st.session_state.get("oauth_state"))
-        token = google.fetch_token(
-            "https://oauth2.googleapis.com/token",
-            authorization_response=full_url,
-            client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
-            redirect_uri=os.getenv("OAUTH_REDIRECT_URI"),
-            auth=None   # 👈 IMPORTANT FIX
-        )
+        # 1) CSRF state check
+        if expected_state and returned_state != expected_state:
+            st.error("OAuth state mismatch. Please try signing in again.")
+            # Clear params to avoid loops
+            st.query_params.clear()
+            st.stop()
+    
+        # 2) Fetch token using 'code' + explicit redirect_uri (no full URL reconstruction)
+        google = get_google_auth(state=expected_state)
+        redirect_uri = os.getenv("OAUTH_REDIRECT_URI")
+    
+        try:
+            token = google.fetch_token(
+                "https://oauth2.googleapis.com/token",
+                code=code,
+                redirect_uri=redirect_uri,                     # MUST exactly match your env & Google Console
+                client_secret=os.getenv("GOOGLE_CLIENT_SECRET"),
+                auth=None                                      # prevent Basic auth header
+            )
+        except Exception as e:
+            # Helpful diagnostics while you adjust URIs; you can remove later
+            st.error(f"OAuthError during token exchange: {e}")
+            st.write("DEBUG redirect_uri:", redirect_uri)
+            st.write("DEBUG code present:", bool(code))
+            st.query_params.clear()
+            st.stop()
+    
+        # 3) Get profile & proceed
+        google = get_google_auth(token=token)
+        resp = google.get("https://www.googleapis.com/oauth2/v2/userinfo")
+        profile = resp.json()
+    
+        email = profile.get("email")
+        name = profile.get("name")
+    
+        admin = admin_col.find_one({"email": email})
+        if admin:
+            session_token = create_session_token()
+            session_data = {
+                "token": session_token,
+                "admin_id": admin["_id"],
+                "username": admin["username"],
+                "created_at": datetime.now(timezone.utc),
+                "expires_at": datetime.now(timezone.utc).timestamp() + 86400
+            }
+    
+            # Keep only 1 session per admin
+            sessions_col.update_one(
+                {"admin_id": admin["_id"]},
+                {"$set": session_data},
+                upsert=True
+            )
+    
+            # Update last_login and increment login_count
+            admin_col.update_one(
+                {"_id": admin["_id"]},
+                {"$set": {"last_login": datetime.now(timezone.utc)}, "$inc": {"login_count": 1}}
+            )
+    
+            st.session_state.authenticated = True
+            st.session_state.admin_username = admin["username"]
+            st.session_state.session_token = session_token
+    
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.error("Your Google account is not authorized as admin.")
+            st.query_params.clear()
+    
+
+    
+        google = get_google_auth(token=token)
+        resp = google.get("https://www.googleapis.com/oauth2/v2/userinfo")
+        profile = resp.json()
+    
+        email = profile.get("email")
+        name = profile.get("name")
+    
+        # Check if this email is an admin in Mongo
+        admin = admin_col.find_one({"email": email})
+        if admin:
+            session_token = create_session_token()
+            session_data = {
+                "token": session_token,
+                "admin_id": admin["_id"],
+                "username": admin["username"],
+                "created_at": datetime.now(timezone.utc),
+                "expires_at": datetime.now(timezone.utc).timestamp() + 86400  # 24h
+            }
+        
+            # Store session in DB
+            # Upsert session → only 1 per admin
+            sessions_col.update_one(
+                {"admin_id": admin["_id"]},
+                {"$set": session_data},
+                upsert=True
+            )
+            
+            # Update last login + increment login counter
+            admin_col.update_one(
+                {"_id": admin["_id"]},
+                {
+                    "$set": {"last_login": datetime.now(timezone.utc)},
+                    "$inc": {"login_count": 1}
+                }
+            )
+            
+        
+            # Set session state
+            st.session_state.authenticated = True
+            st.session_state.admin_username = admin["username"]
+            st.session_state.session_token = session_token
+        
+            # Clear query params so code doesn’t keep firing
+            st.query_params.clear()
+            st.rerun()
+        else:
+            st.error("Your Google account is not authorized as admin.")
 
     
         google = get_google_auth(token=token)
