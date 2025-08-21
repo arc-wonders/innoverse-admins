@@ -3,3 +3,4 @@ pymongo==4.8.0
 pandas==2.2.2
 plotly==5.23.0
 python-dateutil==2.9.0
+authlib
