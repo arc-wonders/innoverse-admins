@@ -56,6 +56,33 @@ forums_col = db.forums
 forum_comments_col = db.forum_comments
 sessions_col = db.admin_sessions
 
+
+# --- Role & session helpers ---
+def get_admin_by_id(admin_id):
+    return admin_col.find_one({"_id": admin_id})
+
+def get_admin_by_email(email):
+    return admin_col.find_one({"email": email})
+
+def is_superadmin_doc(admin_doc):
+    return admin_doc and admin_doc.get("role") == "superadmin"
+
+def get_current_session():
+    tok = st.session_state.get("session_token")
+    if not tok:
+        return None
+    return sessions_col.find_one({"token": tok})
+
+def get_current_admin():
+    sess = get_current_session()
+    if not sess:
+        return None
+    return admin_col.find_one({"_id": sess["admin_id"]})
+
+def is_superadmin_session():
+    return st.session_state.get("effective_role") == "superadmin"
+
+
 # Track mapping
 TRACKS = {
     "ai": "AI/ML",
@@ -166,6 +193,11 @@ def main():
         st.session_state.admin_username = None
     if "session_token" not in st.session_state:
         st.session_state.session_token = None
+    if "admin_role" not in st.session_state:
+        st.session_state.admin_role = "admin"
+    if "effective_role" not in st.session_state:
+        st.session_state.effective_role = "admin"
+    
 
     # --- Google OAuth callback handler ---
     params = st.query_params
@@ -236,6 +268,9 @@ def main():
             st.session_state.authenticated = True
             st.session_state.admin_username = admin["username"]
             st.session_state.session_token = session_token
+            st.session_state.admin_role = admin.get("role", "admin")
+            st.session_state.effective_role = st.session_state.admin_role
+
     
             st.query_params.clear()
             st.rerun()
@@ -351,6 +386,12 @@ def main():
         if username:
             st.session_state.authenticated = True
             st.session_state.admin_username = username
+            cur_admin = get_current_admin()
+            if cur_admin:
+                st.session_state.admin_role = cur_admin.get("role", "admin")
+                if "effective_role" not in st.session_state:
+                    st.session_state.effective_role = st.session_state.admin_role
+
         else:
             # Invalid session, clear state
             st.session_state.authenticated = False
@@ -401,6 +442,20 @@ def admin_dashboard():
     if st.sidebar.button("Logout"):
         # Delete session from DB
         logout_admin(st.session_state.session_token)
+
+        # --- Superadmin mode toggle ---
+        cur_admin = get_current_admin()
+        if cur_admin and is_superadmin_doc(cur_admin):
+            st.sidebar.markdown("### 🛡️ Role Mode")
+            st.session_state.effective_role = st.sidebar.radio(
+                "Choose mode",
+                options=["superadmin", "admin"],
+                index=0 if st.session_state.get("effective_role") == "superadmin" else 1,
+                horizontal=True
+            )
+        else:
+            st.session_state.effective_role = "admin"  # enforce admin-only
+
     
         # Clear all session state keys
         for key in list(st.session_state.keys()):
@@ -414,13 +469,15 @@ def admin_dashboard():
     
     st.sidebar.markdown("---")
     
-    # Navigation
-    page = st.sidebar.selectbox(
-        "Navigate to:",
-        ["📊 Dashboard", "👥 Users", "📝 Tasks", "📄 Submissions", "💬 Forums", "📈 Analytics"]
-    )
-    
-    if page == "📊 Dashboard":
+    pages = ["📊 Dashboard", "👥 Users", "📝 Tasks", "📄 Submissions", "💬 Forums", "📈 Analytics"]
+    if is_superadmin_session():
+        pages.insert(1, "🛡️ Superadmin")  # show extra page only if in superadmin mode
+
+    page = st.sidebar.selectbox("Navigate to:", pages)
+
+    if page == "🛡️ Superadmin":
+        superadmin_page()
+    elif page == "📊 Dashboard":
         dashboard_overview()
     elif page == "👥 Users":
         users_management()
@@ -432,6 +489,7 @@ def admin_dashboard():
         forums_management()
     elif page == "📈 Analytics":
         analytics_page()
+
 
 def dashboard_overview():
     st.header("📊 Dashboard Overview")
@@ -1197,6 +1255,139 @@ def analytics_page():
             track_avg = df.groupby("track")["points"].mean().reset_index()
             fig = px.bar(track_avg, x="track", y="points", title="Average Points by Track")
             st.plotly_chart(fig, use_container_width=True)
+
+def superadmin_page():
+    if not is_superadmin_session():
+        st.error("You must be in Superadmin mode to access this page.")
+        return
+
+    st.header("🛡️ Superadmin Control Panel")
+
+    tabs = st.tabs(["📋 Admins Overview", "➕ Create / Manage Admins", "🧰 Tools"])
+
+    # --- Tab 1: Overview ---
+    with tabs[0]:
+        st.subheader("Admins Overview")
+        admins = list(admin_col.find({}).sort("created_at", -1))
+        if not admins:
+            st.info("No admins found.")
+        else:
+            rows = []
+            for a in admins:
+                rows.append({
+                    "Username": a.get("username", ""),
+                    "Email": a.get("email", ""),
+                    "Role": a.get("role", "admin"),
+                    "Active": "✅" if a.get("is_active", True) else "❌",
+                    "Login Count": a.get("login_count", 0),
+                    "Last Login": a.get("last_login").strftime("%Y-%m-%d %H:%M")
+                                  if a.get("last_login") and hasattr(a.get("last_login"), 'strftime')
+                                  else "—",
+                    "Created": a.get("created_at").strftime("%Y-%m-%d")
+                               if a.get("created_at") and hasattr(a.get("created_at"), 'strftime')
+                               else "—"
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # --- Tab 2: Create / Manage Admins ---
+    with tabs[1]:
+        st.subheader("Create a New Admin")
+
+        with st.form("create_admin_form"):
+            col1, col2 = st.columns(2)
+            with col1:
+                new_username = st.text_input("Username")
+                new_email = st.text_input("Email")
+            with col2:
+                new_role = st.selectbox("Role", ["admin", "superadmin"])
+                active_flag = st.checkbox("Active", value=True)
+
+            submitted = st.form_submit_button("Create Admin")
+            if submitted:
+                if not new_username or not new_email:
+                    st.error("Username and Email are required.")
+                else:
+                    # prevent duplicates
+                    exists = admin_col.find_one({"$or": [{"email": new_email}, {"username": new_username}]})
+                    if exists:
+                        st.error("An admin with this username or email already exists.")
+                    else:
+                        now = datetime.now(timezone.utc)
+                        admin_col.insert_one({
+                            "username": new_username,
+                            "email": new_email,
+                            "role": new_role,
+                            "is_active": active_flag,
+                            "login_count": 0,
+                            "created_at": now,
+                            "updated_at": now
+                        })
+                        st.success(f"Admin '{new_username}' ({new_role}) created successfully.")
+                        st.rerun()
+
+        st.markdown("---")
+        st.subheader("Manage Existing Admins")
+        existing = list(admin_col.find({}).sort("username", 1))
+        if existing:
+            for a in existing:
+                with st.expander(f"{a.get('username','')} • {a.get('email','')}"):
+                    c1, c2, c3, c4 = st.columns([1,1,1,1])
+                    with c1:
+                        st.write(f"**Role:** {a.get('role','admin')}")
+                        st.write(f"**Active:** {'Yes' if a.get('is_active', True) else 'No'}")
+                    with c2:
+                        st.write(f"**Login Count:** {a.get('login_count',0)}")
+                        ll = a.get("last_login")
+                        st.write("**Last Login:** " + (ll.strftime("%Y-%m-%d %H:%M") if ll and hasattr(ll, 'strftime') else "—"))
+                    with c3:
+                        if st.button("Toggle Active", key=f"toggle_active_{a['_id']}"):
+                            admin_col.update_one(
+                                {"_id": a["_id"]},
+                                {"$set": {"is_active": not a.get("is_active", True),
+                                          "updated_at": datetime.now(timezone.utc)}}
+                            )
+                            st.success("Status updated.")
+                            st.rerun()
+                    with c4:
+                        if a.get("role") != "superadmin":
+                            if st.button("Reset Login Count", key=f"reset_logins_{a['_id']}"):
+                                admin_col.update_one({"_id": a["_id"]}, {"$set": {"login_count": 0}})
+                                st.success("Login count reset.")
+                                st.rerun()
+
+                    # Optional: change role
+                    new_r = st.selectbox(
+                        "Change Role",
+                        ["admin", "superadmin"],
+                        index=0 if a.get("role") == "admin" else 1,
+                        key=f"role_sel_{a['_id']}"
+                    )
+                    if new_r != a.get("role"):
+                        if st.button("Apply Role Change", key=f"apply_role_{a['_id']}"):
+                            admin_col.update_one(
+                                {"_id": a["_id"]},
+                                {"$set": {"role": new_r, "updated_at": datetime.now(timezone.utc)}}
+                            )
+                            st.success("Role updated.")
+                            st.rerun()
+        else:
+            st.info("No admins to manage.")
+
+    # --- Tab 3: Tools ---
+    with tabs[2]:
+        st.subheader("Admin Tools")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Force-logout all admins (rotate sessions)"):
+                sessions_col.delete_many({})
+                st.success("All admin sessions cleared.")
+        with col2:
+            if st.button("Deactivate all non-superadmin accounts"):
+                admin_col.update_many(
+                    {"role": {"$ne": "superadmin"}},
+                    {"$set": {"is_active": False, "updated_at": datetime.now(timezone.utc)}}
+                )
+                st.success("All non-superadmin accounts deactivated.")
 
 if __name__ == "__main__":
     main()
