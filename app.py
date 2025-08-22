@@ -399,11 +399,18 @@ def admin_dashboard():
     st.sidebar.title(f"Welcome, {st.session_state.admin_username}!")
     
     if st.sidebar.button("Logout"):
+        # Delete session from DB
         logout_admin(st.session_state.session_token)
-        st.session_state.authenticated = False
-        st.session_state.admin_username = None
-        st.session_state.session_token = None
+    
+        # Clear all session state keys
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+    
+        # Redirect back to login page cleanly
+        st.success("You have been logged out.")
+        st.experimental_set_query_params()  # clear any query params
         st.rerun()
+    
     
     st.sidebar.markdown("---")
     
