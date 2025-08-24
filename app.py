@@ -10,6 +10,9 @@ import plotly.graph_objects as go
 import os
 import hashlib
 import secrets
+import smtplib, ssl
+from email.message import EmailMessage
+
 
 import threading, requests, time
 
@@ -81,6 +84,162 @@ def get_current_admin():
 
 def is_superadmin_session():
     return st.session_state.get("effective_role") == "superadmin"
+
+def _get_env_or_error(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        st.error(f"Missing env var: {key}. Set it in Render → Environment.")
+        st.stop()
+    return val
+
+def get_sender_identity():
+    """Returns (address, display_name)."""
+    email_addr = _get_env_or_error("GMAIL_ADDRESS")
+    display = os.getenv("SENDER_NAME", "Innoverse USICT")
+    return email_addr, display
+
+def _build_email(subject: str, html_body: str, to_addr: str, from_addr: str, from_name: str) -> EmailMessage:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = f"{from_name} <{from_addr}>"
+    msg["To"] = to_addr
+    msg.set_content("This email is best viewed in HTML.")
+    msg.add_alternative(html_body, subtype="html")
+    return msg
+
+def send_email_smtp(msg: EmailMessage):
+    """Send a single email via Gmail SMTP (App Password)."""
+    gmail_addr = _get_env_or_error("GMAIL_ADDRESS")
+    gmail_app_pw = _get_env_or_error("GMAIL_APP_PASSWORD")
+
+    context = ssl.create_default_context()
+    # TLS on 587 (recommended)
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.login(gmail_addr, gmail_app_pw)
+        server.send_message(msg)
+
+def render_task_email(template_key: str, task: dict, user: dict | None = None) -> tuple[str, str]:
+    """
+    Returns (subject, html_body) for a given template_key.
+    template_key ∈ {"new_update", "reminder", "time_finished"}
+    """
+    title = task.get("title", "Task")
+    desc = task.get("description", "")
+    # due_date could be datetime or string; format safely
+    raw_due = task.get("due_date")
+    if hasattr(raw_due, "strftime"):
+        due_str = raw_due.strftime("%Y-%m-%d")
+    else:
+        due_str = str(raw_due) if raw_due else "N/A"
+
+    greeting = f"Hi {user.get('name','there')}" if user else "Hello Innovator"
+
+    base_styles = """
+      font-family: Inter, Arial, sans-serif; color:#0f172a; line-height:1.6;
+    """
+    card = f"""
+      <div style="border:1px solid #e5e7eb;border-radius:12px;padding:16px;background:#ffffff">
+        <h2 style="margin:0 0 8px 0">{title}</h2>
+        <p style="margin:0 0 6px 0"><b>Due date:</b> {due_str}</p>
+        <p style="margin:0"><b>Details:</b> {desc}</p>
+      </div>
+    """
+
+    if template_key == "new_update":
+        subject = f"New Task Update: {title}"
+        body = f"""
+          <div style="{base_styles}">
+            <p>{greeting},</p>
+            <p>There’s a new update on the task below. Please review it and continue your progress.</p>
+            {card}
+            <p style="margin-top:12px">Best,<br/>Innoverse USICT Team</p>
+          </div>
+        """
+    elif template_key == "reminder":
+        subject = f"Reminder: {title} is due on {due_str}"
+        body = f"""
+          <div style="{base_styles}">
+            <p>{greeting},</p>
+            <p>This is a friendly reminder to complete the following task before the deadline.</p>
+            {card}
+            <p style="margin-top:12px">You’ve got this! 💪<br/>Innoverse USICT Team</p>
+          </div>
+        """
+    elif template_key == "time_finished":
+        subject = f"Time Finished for: {title}"
+        body = f"""
+          <div style="{base_styles}">
+            <p>{greeting},</p>
+            <p>The time window for this task has ended. If you’ve submitted, great—watch for updates.
+               If not, stay tuned for upcoming tasks and opportunities.</p>
+            {card}
+            <p style="margin-top:12px">Regards,<br/>Innoverse USICT Team</p>
+          </div>
+        """
+    else:
+        subject = f"Update: {title}"
+        body = f"""
+          <div style="{base_styles}">
+            <p>{greeting},</p>
+            <p>Here’s an update about the task:</p>
+            {card}
+            <p style="margin-top:12px">Innoverse USICT Team</p>
+          </div>
+        """
+
+    return subject, body
+
+def gather_recipients_for_task(task_id: ObjectId, scope: str) -> list[dict]:
+    """
+    scope: "all" → all users in the system
+           "assigned" → only users assigned to this task
+    Returns a list of user documents (must have 'email').
+    """
+    if scope == "all":
+        users = list(users_col.find({"email": {"$exists": True, "$ne": ""}}, {"name":1,"email":1}))
+        return users
+
+    # assigned users
+    assignments = list(db.task_assignments.find({"task_id": task_id}, {"user_id": 1}))
+    user_ids = [a["user_id"] for a in assignments if a.get("user_id")]
+    if not user_ids:
+        return []
+    users = list(users_col.find(
+        {"_id": {"$in": user_ids}, "email": {"$exists": True, "$ne": ""}},
+        {"name":1,"email":1}
+    ))
+    return users
+
+def send_bulk_emails_for_task(task: dict, template_key: str, scope: str, progress_cb=None) -> tuple[int,int,list[str]]:
+    """
+    Sends emails in bulk.
+    Returns (sent_count, fail_count, failed_emails).
+    """
+    from_addr, from_name = get_sender_identity()
+    recipients = gather_recipients_for_task(task["_id"], scope)
+    total = len(recipients)
+    sent, failed = 0, 0
+    failed_list = []
+
+    for idx, user in enumerate(recipients, start=1):
+        try:
+            subject, html = render_task_email(template_key, task, user)
+            msg = _build_email(subject, html, user["email"], from_addr, from_name)
+            send_email_smtp(msg)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            failed_list.append(f'{user.get("email","")} → {e}')
+        finally:
+            # Update progress UI if provided
+            if progress_cb:
+                progress_cb(idx, total)
+            # Be gentle with Gmail: small delay helps avoid rate limits
+            time.sleep(0.2)
+
+    return sent, failed, failed_list
 
 
 # Track mapping
@@ -598,29 +757,24 @@ def users_management():
 def tasks_management():
     st.header("📝 Tasks Management")
     
-    # Task creation form
+    # ---------------- Create New Task ----------------
     with st.expander("➕ Create New Task"):
         with st.form("create_task"):
             col1, col2 = st.columns(2)
-            
             with col1:
                 title = st.text_input("Task Title")
                 track = st.selectbox("Track", ["ai", "webdev", "dsa", "app"], format_func=lambda x: TRACKS[x])
                 difficulty = st.selectbox("Difficulty", ["beginner", "intermediate", "advanced"])
                 points = st.number_input("Points", min_value=1, value=100)
-            
             with col2:
                 due_date = st.date_input("Due Date")
                 task_type = st.selectbox("Type", ["individual", "team"])
                 is_active = st.checkbox("Active", value=True)
-            
             description = st.text_area("Description")
             requirements = st.text_area("Requirements (one per line)")
-            
             if st.form_submit_button("Create Task"):
                 if title and description:
                     req_list = [req.strip() for req in requirements.split('\n') if req.strip()]
-                    
                     task_data = {
                         "title": title,
                         "description": description,
@@ -636,89 +790,68 @@ def tasks_management():
                         "created_at": datetime.now(timezone.utc),
                         "updated_at": datetime.now(timezone.utc)
                     }
-                    
                     tasks_col.insert_one(task_data)
                     st.success("Task created successfully!")
                     st.rerun()
                 else:
                     st.error("Title and description are required!")
     
-    # Individual task assignment form
+    # ---------------- Assign Task to Individual User ----------------
     with st.expander("👤 Assign Task to Individual User"):
         st.subheader("Select Assignment Type")
         assignment_type = st.radio("Choose assignment type:", 
-                                 ["Assign Existing Task", "Create Custom Task"], 
-                                 horizontal=True)
-        
+                                   ["Assign Existing Task", "Create Custom Task"], 
+                                   horizontal=True)
         if assignment_type == "Assign Existing Task":
-            # Get all users first (outside the form for search)
             all_users = list(users_col.find({}, {"_id": 1, "name": 1, "email": 1}))
-            
-            # User search outside form
             st.subheader("🔍 Find User")
             search_query = st.text_input("Search users by name or email", key="user_search_existing_outside")
-            
-            # Filter users based on search
+            filtered_users = []
             if search_query:
                 filtered_users = [
                     user for user in all_users 
-                    if search_query.lower() in user['name'].lower() or 
-                       search_query.lower() in user['email'].lower()
+                    if search_query.lower() in user['name'].lower() or search_query.lower() in user['email'].lower()
                 ]
-                
                 if filtered_users:
                     st.write(f"**Found {len(filtered_users)} matching users:**")
-                    for user in filtered_users[:5]:  # Show max 5 results
+                    for user in filtered_users[:5]:
                         st.write(f"• **{user['name']}** - {user['email']}")
                 else:
                     st.write("No users found matching your search.")
-            
             st.markdown("---")
-            
-            # Existing task assignment
             with st.form("assign_existing_task"):
                 col1, col2 = st.columns(2)
-                
                 with col1:
-                    # Get all active tasks
                     active_tasks = list(tasks_col.find({"is_active": True}))
                     if active_tasks:
                         task_options = {str(task["_id"]): f"{task['title']} ({TRACKS.get(task.get('track', ''), task.get('track', 'Unknown'))})" for task in active_tasks}
                         selected_task_id = st.selectbox("Select Task", options=list(task_options.keys()), 
-                                                       format_func=lambda x: task_options[x])
+                                                        format_func=lambda x: task_options[x])
                     else:
                         st.warning("No active tasks available")
                         selected_task_id = None
-                
                 with col2:
-                    # User selection - show all users or filtered ones
                     st.write("**Select User:**")
                     display_users = filtered_users if search_query and filtered_users else all_users[:20]
-                    
                     if display_users:
                         user_options = {str(user["_id"]): f"{user['name']} ({user['email']})" for user in display_users}
                         selected_user_id = st.selectbox(f"Available Users ({len(display_users)})", 
-                                                       options=list(user_options.keys()), 
-                                                       format_func=lambda x: user_options[x],
-                                                       key="user_select_existing")
+                                                        options=list(user_options.keys()), 
+                                                        format_func=lambda x: user_options[x],
+                                                        key="user_select_existing")
                     else:
                         st.warning("No users available")
                         selected_user_id = None
-                
                 assignment_note = st.text_area("Assignment Note (optional)", 
-                                             placeholder="Add any specific instructions for this user...",
-                                             key="note_existing")
-                
+                                               placeholder="Add any specific instructions for this user...",
+                                               key="note_existing")
                 submit_existing = st.form_submit_button("Assign Existing Task", use_container_width=True)
-                
                 if submit_existing:
                     if selected_task_id and selected_user_id and active_tasks:
-                        # Check if already assigned
                         existing_assignment = db.task_assignments.find_one({
                             "task_id": ObjectId(selected_task_id),
                             "user_id": ObjectId(selected_user_id)
                         })
-                        
                         if not existing_assignment:
                             assignment_data = {
                                 "task_id": ObjectId(selected_task_id),
@@ -729,90 +862,64 @@ def tasks_management():
                                 "status": "assigned",
                                 "assignment_type": "existing"
                             }
-                            
                             db.task_assignments.insert_one(assignment_data)
-                            
-                            # Get task and user details for success message
                             task_title = [task['title'] for task in active_tasks if str(task['_id']) == selected_task_id][0]
                             user_name = user_options[selected_user_id]
-                            
                             st.success(f"Task '{task_title}' assigned to {user_name} successfully!")
                             st.rerun()
                         else:
                             st.error("This task is already assigned to this user!")
                     else:
                         st.error("Please select both a task and a user!")
-        
-        else:  # Create Custom Task
-            # Get all users first (outside the form for search)
+        else:
             all_users = list(users_col.find({}, {"_id": 1, "name": 1, "email": 1}))
-            
-            # User search outside form
             st.subheader("🔍 Find User")
             search_query_custom = st.text_input("Search users by name or email", key="user_search_custom_outside")
-            
-            # Filter users based on search
+            filtered_users_custom = []
             if search_query_custom:
                 filtered_users_custom = [
                     user for user in all_users 
-                    if search_query_custom.lower() in user['name'].lower() or 
-                       search_query_custom.lower() in user['email'].lower()
+                    if search_query_custom.lower() in user['name'].lower() or search_query_custom.lower() in user['email'].lower()
                 ]
-                
                 if filtered_users_custom:
                     st.write(f"**Found {len(filtered_users_custom)} matching users:**")
-                    for user in filtered_users_custom[:5]:  # Show max 5 results
+                    for user in filtered_users_custom[:5]:
                         st.write(f"• **{user['name']}** - {user['email']}")
                 else:
                     st.write("No users found matching your search.")
-            
             st.markdown("---")
-            
             with st.form("assign_custom_task"):
                 st.subheader("Create & Assign Custom Task")
-                
-                # User search and selection
                 col1, col2 = st.columns(2)
-                
                 with col1:
-                    # Custom task details
                     custom_title = st.text_input("Custom Task Title")
                     custom_track = st.selectbox("Track", ["ai", "webdev", "dsa", "app"], 
-                                              format_func=lambda x: TRACKS[x], key="custom_track")
+                                                format_func=lambda x: TRACKS[x], key="custom_track")
                     custom_difficulty = st.selectbox("Difficulty", ["beginner", "intermediate", "advanced"], 
-                                                   key="custom_difficulty")
+                                                     key="custom_difficulty")
                     custom_points = st.number_input("Points", min_value=1, value=100, key="custom_points")
                     custom_due_date = st.date_input("Due Date", key="custom_due_date")
-                
                 with col2:
-                    # User selection - show all users or filtered ones
                     st.write("**Select User:**")
                     display_users_custom = filtered_users_custom if search_query_custom and filtered_users_custom else all_users[:20]
-                    
                     if display_users_custom:
                         user_options_custom = {str(user["_id"]): f"{user['name']} ({user['email']})" for user in display_users_custom}
                         selected_user_id_custom = st.selectbox(f"Available Users ({len(display_users_custom)})", 
-                                                             options=list(user_options_custom.keys()), 
-                                                             format_func=lambda x: user_options_custom[x],
-                                                             key="user_select_custom")
+                                                               options=list(user_options_custom.keys()), 
+                                                               format_func=lambda x: user_options_custom[x],
+                                                               key="user_select_custom")
                     else:
                         st.warning("No users available")
                         selected_user_id_custom = None
-                
                 custom_description = st.text_area("Task Description", key="custom_description")
                 custom_requirements = st.text_area("Requirements (one per line)", key="custom_requirements")
                 assignment_note_custom = st.text_area("Assignment Note (optional)", 
-                                                    placeholder="Add any specific instructions for this user...",
-                                                    key="note_custom")
-                
-                # Submit button
+                                                      placeholder="Add any specific instructions for this user...",
+                                                      key="note_custom")
                 submit_custom = st.form_submit_button("Create & Assign Custom Task", use_container_width=True)
-                
                 if submit_custom:
                     if custom_title and custom_description and selected_user_id_custom:
-                        # Create the custom task first
                         req_list = [req.strip() for req in custom_requirements.split('\n') if req.strip()]
-                        
                         custom_task_data = {
                             "title": custom_title,
                             "description": custom_description,
@@ -827,15 +934,11 @@ def tasks_management():
                             "created_by": st.session_state.admin_username,
                             "created_at": datetime.now(timezone.utc),
                             "updated_at": datetime.now(timezone.utc),
-                            "is_custom": True,  # Mark as custom task
-                            "assigned_to": ObjectId(selected_user_id_custom)  # Link to specific user
+                            "is_custom": True,
+                            "assigned_to": ObjectId(selected_user_id_custom)
                         }
-                        
-                        # Insert the custom task
                         custom_task_result = tasks_col.insert_one(custom_task_data)
                         custom_task_id = custom_task_result.inserted_id
-                        
-                        # Create assignment record
                         assignment_data = {
                             "task_id": custom_task_id,
                             "user_id": ObjectId(selected_user_id_custom),
@@ -845,10 +948,7 @@ def tasks_management():
                             "status": "assigned",
                             "assignment_type": "custom"
                         }
-                        
                         db.task_assignments.insert_one(assignment_data)
-                        
-                        # Success message
                         user_name = user_options_custom[selected_user_id_custom]
                         st.success(f"Custom task '{custom_title}' created and assigned to {user_name} successfully!")
                         st.rerun()
@@ -857,18 +957,15 @@ def tasks_management():
     
     st.markdown("---")
     
-    # Show recent task assignments
+    # ---------------- Recent Task Assignments ----------------
     with st.expander("📋 Recent Task Assignments"):
         recent_assignments = list(db.task_assignments.find({}).sort("assigned_at", -1).limit(10))
-        
         if recent_assignments:
             for assignment in recent_assignments:
                 task = tasks_col.find_one({"_id": assignment["task_id"]})
                 user = users_col.find_one({"_id": assignment["user_id"]})
-                
                 if task and user:
                     col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
-                    
                     with col1:
                         st.write(f"**Task:** {task['title']}")
                         if task.get('is_custom'):
@@ -881,16 +978,13 @@ def tasks_management():
                     with col4:
                         if st.button("Remove", key=f"remove_assignment_{assignment['_id']}"):
                             db.task_assignments.delete_one({"_id": assignment["_id"]})
-                            # If it's a custom task, optionally remove the task too
                             if task.get('is_custom'):
                                 if st.button("Also delete custom task?", key=f"delete_custom_{task['_id']}"):
                                     tasks_col.delete_one({"_id": task["_id"]})
                             st.success("Assignment removed!")
                             st.rerun()
-                    
                     if assignment.get("note"):
                         st.write(f"*Note: {assignment['note']}*")
-                    
                     assigned_date = assignment.get('assigned_at', 'Unknown')
                     if hasattr(assigned_date, 'strftime'):
                         assigned_str = assigned_date.strftime('%Y-%m-%d %H:%M')
@@ -903,21 +997,17 @@ def tasks_management():
     
     st.markdown("---")
     
-    # Task list
+    # ---------------- All Tasks (with Email Panel) ----------------
     st.subheader("All Tasks")
-    
-    # Filters
     col1, col2, col3 = st.columns(3)
     with col1:
-        track_filter = st.selectbox("Filter by Track", ["All"] + list(TRACKS.keys()), 
-                                  format_func=lambda x: TRACKS[x] if x in TRACKS else x, 
-                                  key="task_track_filter")
+        track_filter = st.selectbox("Filter by Track", ["All"] + list(TRACKS.keys()),
+                                    format_func=lambda x: TRACKS[x] if x in TRACKS else x, 
+                                    key="task_track_filter")
     with col2:
         difficulty_filter = st.selectbox("Filter by Difficulty", ["All", "beginner", "intermediate", "advanced"])
     with col3:
         status_filter = st.selectbox("Filter by Status", ["All", "Active", "Inactive"], key="task_status_filter")
-    
-    # Build query
     query = {}
     if track_filter != "All":
         query["track"] = track_filter
@@ -929,20 +1019,14 @@ def tasks_management():
         query["is_active"] = False
     
     tasks = list(tasks_col.find(query).sort("created_at", -1))
-    
     if tasks:
         for task in tasks:
-            # Safe track lookup
             track_name = TRACKS.get(task.get('track', ''), task.get('track', 'Unknown'))
-            
             with st.expander(f"{task['title']} - {track_name} ({task['difficulty']})"):
                 col1, col2 = st.columns([3, 1])
-                
                 with col1:
                     st.write(f"**Description:** {task['description']}")
                     st.write(f"**Points:** {task['points']}")
-                    
-                    # Safe date handling
                     due_date = task.get('due_date', 'Not set')
                     if hasattr(due_date, 'strftime'):
                         due_date_str = due_date.strftime('%Y-%m-%d')
@@ -951,23 +1035,191 @@ def tasks_management():
                     else:
                         due_date_str = str(due_date)
                     st.write(f"**Due Date:** {due_date_str}")
-                    
                     st.write(f"**Type:** {task['type']}")
                     if task.get('requirements'):
                         st.write("**Requirements:**")
                         for req in task['requirements']:
                             st.write(f"• {req}")
-                
                 with col2:
                     st.write(f"**Status:** {'✅ Active' if task['is_active'] else '❌ Inactive'}")
-                    
-                    # Toggle active status
                     if st.button(f"{'Deactivate' if task['is_active'] else 'Activate'}", key=f"toggle_{task['_id']}"):
                         tasks_col.update_one(
                             {"_id": task["_id"]},
                             {"$set": {"is_active": not task['is_active'], "updated_at": datetime.now(timezone.utc)}}
                         )
                         st.rerun()
+
+                # ---------- 📧 Email Users About This Task ----------
+                st.markdown("---")
+                st.subheader("📧 Email users about this task")
+
+                # Fail-fast if email env is not configured
+                try:
+                    _ = get_sender_identity()
+                except Exception as e:
+                    st.error(f"Email sending not configured: {e}")
+                    continue
+
+                tid = str(task["_id"])
+
+                # NEW: add "track" and "single_user" scopes
+                scope = st.radio(
+                    "Recipients",
+                    options=["all", "assigned", "track", "single_user"],
+                    format_func=lambda v: (
+                        "All users (system-wide)" if v == "all" else
+                        "Only users assigned to this task" if v == "assigned" else
+                        "Users in a specific track" if v == "track" else
+                        "Search and send to one user"
+                    ),
+                    horizontal=True,
+                    key=f"scope_{tid}"
+                )
+
+                # Template & preview
+                template_key = st.selectbox(
+                    "Template",
+                    options=["new_update", "reminder", "time_finished"],
+                    format_func=lambda k: {
+                        "new_update": "New Task Update",
+                        "reminder": "Reminder of Task",
+                        "time_finished": "Task Time Finished"
+                    }[k],
+                    key=f"tmpl_{tid}"
+                )
+                default_subject, default_html = render_task_email(template_key, task, None)
+                subject_input = st.text_input("Subject", value=default_subject, key=f"subj_{tid}")
+                st.markdown("**Preview (HTML):**")
+                st.markdown(default_html, unsafe_allow_html=True)
+
+                # Build recipient list per scope
+                recipient_emails = []
+                track_key_selected = None
+
+                if scope in ["all", "assigned"]:
+                    recips_preview = gather_recipients_for_task(task["_id"], scope)
+                    if not recips_preview:
+                        st.warning("No recipients found for this scope.")
+                    else:
+                        recipient_emails = [u["email"] for u in recips_preview if u.get("email")]
+                        st.caption(f"About to email **{len(recipient_emails)}** user(s).")
+
+                elif scope == "track":
+                    track_key_selected = st.selectbox(
+                        "Select track",
+                        list(TRACKS.keys()),
+                        format_func=lambda x: TRACKS[x],
+                        key=f"email_track_{tid}"
+                    )
+                    if track_key_selected:
+                        users_in_track = list(users_col.find(
+                            {"profile.coding_track": track_key_selected, "email": {"$exists": True, "$ne": ""}},
+                            {"name": 1, "email": 1}
+                        ))
+                        if not users_in_track:
+                            st.warning(f"No users found in track: {TRACKS.get(track_key_selected, track_key_selected)}")
+                        else:
+                            recipient_emails = [u["email"] for u in users_in_track]
+                            st.caption(
+                                f"Track **{TRACKS.get(track_key_selected, track_key_selected)}** → "
+                                f"**{len(recipient_emails)}** user(s)."
+                            )
+
+                elif scope == "single_user":
+                    search_query_one = st.text_input("🔍 Search user by name or email", key=f"user_search_{tid}")
+                    if search_query_one:
+                        matches = list(users_col.find({
+                            "$or": [
+                                {"name": {"$regex": search_query_one, "$options": "i"}},
+                                {"email": {"$regex": search_query_one, "$options": "i"}}
+                            ]
+                        }).limit(5))
+                        if matches:
+                            user_options = {str(u["_id"]): f"{u['name']} ({u['email']})" for u in matches}
+                            selected_uid = st.selectbox(
+                                "Select User",
+                                options=list(user_options.keys()),
+                                format_func=lambda x: user_options[x],
+                                key=f"user_sel_{tid}"
+                            )
+                            if selected_uid:
+                                udoc = users_col.find_one({"_id": ObjectId(selected_uid)}, {"name": 1, "email": 1})
+                                if udoc and udoc.get("email"):
+                                    recipient_emails = [udoc["email"]]
+                                    st.caption(f"Will send to: **{udoc['name']}** ({udoc['email']})")
+                        else:
+                            st.info("No matching users found.")
+
+                # Buttons
+                c1, c2, _ = st.columns([1, 1, 2])
+                cur_admin = get_current_admin()
+                admin_email = (cur_admin or {}).get("email")
+
+                with c1:
+                    if admin_email and st.button("Send test to me", key=f"send_test_{tid}"):
+                        try:
+                            from_addr, from_name = get_sender_identity()
+                            msg = _build_email(subject_input, default_html, admin_email, from_addr, from_name)
+                            send_email_smtp(msg)
+                            st.success(f"Sent test email to {admin_email}")
+                        except Exception as e:
+                            st.error(f"Failed to send test: {e}")
+
+                with c2:
+                    if recipient_emails:
+                        confirm = st.checkbox("Confirm send", key=f"confirm_{tid}")
+                        if confirm and st.button("Send to recipients", key=f"send_all_{tid}"):
+                            prog = st.progress(0.0)
+                            status_txt = st.empty()
+
+                            def _cb(i, total):
+                                frac = (i / total) if total else 0
+                                prog.progress(frac)
+                                status_txt.write(f"Sending… {i}/{total}")
+
+                            try:
+                                if scope == "single_user" or scope == "track":
+                                    # Manual send loop for custom recipient list
+                                    sent, failed, fails = 0, 0, []
+                                    from_addr, from_name = get_sender_identity()
+                                    total = len(recipient_emails)
+                                    for idx, to in enumerate(recipient_emails, start=1):
+                                        try:
+                                            # personalize if you want user names (we send generic here)
+                                            msg = _build_email(subject_input, default_html, to, from_addr, from_name)
+                                            send_email_smtp(msg)
+                                            sent += 1
+                                        except Exception as e:
+                                            failed += 1
+                                            fails.append(f"{to} → {e}")
+                                        _cb(idx, total)
+                                        time.sleep(0.2)
+                                else:
+                                    # use bulk helper for all/assigned
+                                    sent, failed, fails = send_bulk_emails_for_task(
+                                        task, template_key, scope, progress_cb=_cb, override_subject=subject_input
+                                    )
+                            except TypeError:
+                                # fallback if helper lacks override_subject
+                                orig_render = render_task_email
+                                def render_override(tk, tsk, usr):
+                                    _, html = orig_render(tk, tsk, usr)
+                                    return subject_input, html
+                                try:
+                                    globals()['render_task_email'] = render_override
+                                    sent, failed, fails = send_bulk_emails_for_task(task, template_key, scope, progress_cb=_cb)
+                                finally:
+                                    globals()['render_task_email'] = orig_render
+
+                            prog.empty(); status_txt.empty()
+                            if sent:
+                                st.success(f"Emails sent: {sent}")
+                            if failed:
+                                with st.expander(f"Show {failed} failures"):
+                                    for line in fails:
+                                        st.write("• ", line)
+                            if sent or failed:
+                                st.toast(f"Done. Sent {sent}, Failed {failed}", icon="📧")
     else:
         st.info("No tasks found matching the criteria.")
 
